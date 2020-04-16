@@ -1,0 +1,576 @@
+---
+title: "Predict SCN5A Variant Function Using Structure and *In Silico* Features"
+author: "B"
+date: "January 23, 2018"
+output: 
+  pdf_document: 
+    highlight: pygments
+    toc: true
+    toc_depth: 4
+---
+
+# Introduction
+This document is meant to assess how well we can predict functional perturbation from SCN5A missense variants. We're especially interested in the contribution of structure-based features. 
+
+## Notes:
+
+Should I report non-transformed ilate and recovfrominact as well as log transformed? Why not? These were tried and did not contribute to any difference.
+
+## Read Data
+```{r load, echo = TRUE}
+# load all required libraries
+library(caret)
+library(plotrix)
+library(glmnet)
+library(meta)
+library(reshape2)
+library(psych)
+require(Hmisc)
+library(tableone)
+library(ggplot2)
+library("DBI")
+library("RSQLite")
+library(wCorr)
+library(rms)
+library(boot)
+library(leaps)
+library(car)
+library(reticulate)
+source('C:/Users/Brett/Dropbox/SCN5A/predict_function/func_dist.R')
+
+# import the picked file with nested dictionaries of 
+# distances between residue centriods.
+p <- import("pickle")
+py <- import_builtins()
+distances <- p$load(py$open(
+  'C:/Users/Brett/Dropbox/SCN5A/predict_function/data/5A_5x0m/5A_save_5x0m.p', "rb"))
+
+# figure path and data path
+feat.path <- "C:/Users/Brett/Dropbox/SCN5A/predict_function/data/" # also has the target file
+
+# load data
+targ <- "C:/Users/Brett/Dropbox/SCN5A/BrettsSandbox/paper/resubmit/TableS2.csv"
+new <- "5A_5x0m/sin_pam_energy_funcdist.csv"
+bcl  <- read.csv("/Users/Brett/Dropbox/SCN5A/predict_function/data/5A_5x0m/scn5a_bcl_features_5x0m.txt", header = TRUE, sep = "\t")
+sasa <- read.csv("/Users/Brett/Dropbox/SCN5A/predict_function/data/5A_5x0m/5a_5x0m_sasa.csv", header = TRUE)
+d <- read.csv(targ, header = TRUE)
+colnames(d)[1] <- "var"
+e <- read.csv(paste(feat.path,new, sep=""), header = TRUE)
+d <- merge(d,e, all = TRUE)
+d <- d[d$mut_type == "missense" | d$mut_type == "aadel" | d$mut_type == "aains",]
+d <- unique(d)
+d <- merge(d,bcl, all = TRUE)
+d <- merge(d,sasa, all = TRUE)
+d <- d[!is.na(d$var),]
+d <- unique(d)
+#d <- d[!is.na(d$aaneigh),]
+d$recovfrominact<-10^(d$recovfrominact)
+d$ilate<-10^(d$ilate)
+#d$ilate_norm<-10^(d$ilate_norm)
+
+
+d$LOF <- NA
+d$LOF[d$ipeak>=50] <- 0
+d$LOF[d$ipeak<50 | d$vhalfact > 10] <- 1
+
+#d <- d[,c(1:21,24:58,22:23)]
+#d <- d[,c(1:4,6:58,5)]
+#d <- d[d$total_carriers>3,]
+
+functions <- c("ipeak", "ilate", "vhalfact", "vhalfinact", "recovfrominact")
+comps <- c("NeighborVector", "NeighborCount", "aaneigh", "aaneighvector", "pamscore", "SIFT", "eaRate", "blastpssm",  "provean_score", "polyphen2")
+
+clinvar.path <- "C:/Users/Brett/Dropbox/SCN5A/predict_function/paper/"
+clinvar <- read.csv(paste(clinvar.path,"scn5a_clinvar.csv", sep=""), header = TRUE)
+g <- merge(clinvar,d, all = T)
+g <- g[!is.na(g$var),]
+g <- unique(g)
+write.csv(g,"C:/Users/Brett/Dropbox/SCN5A/predict_function/paper/Table5A_clinvar.csv")
+
+```
+
+## Summary Statistics
+
+```{r table1}
+vari <- c(functions,"ilate_norm")
+t1 <- CreateTableOne(vars = vari, data=d)
+print(t1, nonnormal=vari)
+```
+
+## Functions: Plot LOESS with Points
+
+```{r functions, echo=TRUE}
+
+plt.loess <- function(fit, xlabel="X", ylabel="Y", xlims=NA, ylims=NA){
+  if(sum(is.na(xlims) & is.na(ylims))>0){
+    lines(min(fit$x)-1000, 0, xlim=c(min(fit$x), max(fit$x)), ylim=c(min(fit$y), max(fit$y)), ylab=ylabel, xlab=xlabel)
+  } else{ if(is.na(xlims)){
+    lines(min(fit$x)-1000, 0, xlim=c(min(fit$x), max(fit$x)), ylim=ylims, ylab=ylabel, xlab=xlabel)
+  } else{
+    lines(min(fit$x)-1000, 0, xlim=xlims, ylim=ylims, ylab=ylabel, xlab=xlabel)
+  }
+  }
+  xrange <- seq(min(fit$x), max(fit$x), length.out = 100)
+  ps <- predict(fit, xrange, se=T)
+  lines(xrange, ps$fit*1, lwd=5)
+  lines(xrange, (ps$fit+1.96*ps$se.fit)*1, lty=2, lwd=4)
+  lines(xrange, (ps$fit-1.96*ps$se.fit)*1, lty=2, lwd=4)
+}
+
+```
+
+## Histograms of functional parameters
+
+```{r histograms}
+hist(d$ipeak, breaks = 20)
+hist(d$vhalfact, breaks = 20)
+hist(d$vhalfinact, breaks = 20)
+hist(log10(d$recovfrominact), breaks = 20)
+hist(log10(d$ilate), breaks = 20)
+
+```
+
+# Histogram of Distance Distributions
+
+```{r dist_hist}
+tmp <- unlist(distances)
+tmpp <- hist(tmp[tmp<=20], probability = T, breaks = 100)
+hist(tmp[tmp<=20], probability = T, breaks = 100)
+axis(side=1, at=seq(0,20,1))
+plot(tmpp$breaks[-c(1,2)],tmpp$density[-1]/(tmpp$breaks[-c(1,2)]^2), type="o", ylab = "Density", xlab = "Distance")
+# looks like maxima at 6.5, 11, and 15
+```
+
+# Calculate functional densities
+
+```{r calc_func_dists}
+
+for (EP_function in functions){
+  feat_dist <- paste(EP_function, "_dist", sep = "")
+  feat_dist_weight <- paste(EP_function,"_dist_weight", sep = "")
+  d[, feat_dist]<-NA
+  d[, feat_dist_weight]<-NA
+  for(rec in 1:nrow(d)){
+    d[rec, c(feat_dist, feat_dist_weight)] <- funcdist(d[rec, "resnum"], d[rec, "mutAA"], d, distances, EP_function, "sigmoid", 7)
+  }
+}
+```
+
+# Heatmap of Pearson R values (absolute values)
+
+```{r heatmap, echo=TRUE}
+# select all covariates and responses I want to analyze 
+dists <- d[!is.na(d$ipeak_dist), c(functions, paste(functions,"_dist",sep = ""),comps,
+                                   paste(functions,"_dist_weight",sep = ""))]
+
+# Make pearson correlation matrix of calculated vs. experimental functional 
+# parameters and some in silico predicive models. Plot heatmap of R values
+mat = data.matrix(dists) # corr.test needs a matrix
+
+rcor<-corr.test(mat,use='pairwise.complete.obs', method = 'pearson')
+rcor$r<-(rcor$r)^2
+
+# make ggplot object
+p<-ggplot(melt(rcor$r), aes(Var1,ordered(Var2, levels = rev(sort(unique(Var2))))))+ geom_tile(aes(fill = value), color = "white") + scale_fill_gradient(low = "white", high = "steelblue") 
+
+#ordered(Var2, levels = rev(sort(unique(Var2))))
+base_size<-9
+p+ theme_grey(base_size = base_size) + labs(x = "", y = "") + 
+  scale_x_discrete(expand = c(0, 0)) + 
+  scale_y_discrete(expand = c(0, 0)) + theme(legend.position = "none", axis.text.x.top = element_text(angle = 90, vjust=0.5, hjust=0)) + scale_x_discrete(position = "top")
+
+```
+
+# Linear Models Predicting Functional Features
+Test several different models, including a few feature sets. Include 95% CI intervals on Pearson R^2.
+
+## Peak Current
+
+### Parameter Selection for Peak Current Model
+
+```{r LASSO_peak}
+
+d2 <- d[, which(names(d) %in% c("ipeak", "ipeak_dist", "ipeak_dist_weight", comps))]
+d2 <- d2[complete.cases(d2),]
+
+cv.lass <- cv.glmnet( as.matrix(d2[,-which(names(d2)=="ipeak")]), d2$ipeak) 
+fin.lass <- glmnet(as.matrix(d2[,-which(names(d2)=="ipeak")]), d2$ipeak, lambda = cv.lass$lambda.min)  
+fin.lass$beta
+
+```
+
+```{r LASSO_peak_CV_modelling}
+
+LASSO_CV(d,10,comps,"ipeak")
+#June 11, 2018: mean  0.229844408389791  95% CI:  0.0950763623663287 ,  0.423146694973547
+
+```
+
+### Predicting ipeak with Best Predictors found in Previous Step and bootstrap 95% CIs
+
+```{r ipeak_lm}
+# all predictors
+ln_peak <- lm(ipeak~., data = d2[, c("ipeak", fin.lass$beta@Dimnames[[1]][1+fin.lass$beta@i])])
+summary(ln_peak)
+foo <- boot(d, function(data,indices)
+  summary(lm(ipeak~., data = d2[indices, c("ipeak", fin.lass$beta@Dimnames[[1]][1+fin.lass$beta@i])]))$adj.r.squared, R=1000)
+foo$t0
+quantile(foo$t,c(0.025,0.975))
+
+```
+
+### Plot Experimental Functional Parameters Against Predictive Features
+
+```{r ipeak_raw_plot, echo=TRUE}
+# plot relationships between functional parameters and calculated structure-based
+# functional parameters.
+plot(d$ipeak_dist, d$ipeak, cex=2, lwd=2, xlim = c(0,125), ylim = c(0,250))
+plt.loess(loess(d$ipeak~as.numeric(d$ipeak_dist), span=0.7),ylabel= "Peak Current")
+
+plot(d$pamscore, d$ipeak, cex=2, lwd=1, xlim = c(-11,3), ylim = c(0,250))
+plt.loess(loess(d$ipeak~as.numeric(d$pamscore), span=0.7),ylabel= "Peak Current")
+
+plot(d$polyphen2, d$ipeak, cex=2, lwd=1, ylim = c(0,250))
+plt.loess(loess(d$ipeak~as.numeric(d$polyphen2), span=0.7),ylabel= "Peak Current")
+```
+
+### Plot Predicted and Experimental Peak Current
+
+```{r ipeak_exp_pred, fig.height=8, fig.width=8}
+plot(ln_peak$fitted.values,ln_peak$model$ipeak, ylim = c(0,max(ln_peak$model$ipeak)), xlim = c(0, max(ln_peak$model$ipeak)),cex=2, lwd=1)
+abline(a=0,b=1)
+```
+
+
+## Late Current
+
+Models are not good when ilate is linear, not transformed exponentially: LASSO doesn't want to keep any features, at least not consistantly. We have the same problem when ilate is log transformed.
+
+### Parameter Selection for Late Current Model
+
+```{r LASSO_ilate}
+
+d2 <- d[, which(names(d) %in% c("ilate", "ilate_dist", "ilate_dist_weight", comps))]
+d2 <- d2[complete.cases(d2),]
+
+cv.lass <- cv.glmnet( as.matrix(d2[,-which(names(d2)=="ilate")]), d2$ilate) 
+fin.lass <- glmnet(as.matrix(d2[,-which(names(d2)=="ilate")]), d2$ilate, lambda = cv.lass$lambda.min)  
+fin.lass$beta
+
+```
+
+```{r LASSO_ilate_CV_modelling}
+# Too volatile, selects 0 features at times. 
+LASSO_CV(d,10,comps,"ilate")
+
+```
+
+### Predicting ilate with Best Predictors found in Previous Step and bootstrap 95% CIs
+
+```{r ilate_lm}
+# all predictors
+ln_late <- lm(ilate~., data = d2[, c("ilate", fin.lass$beta@Dimnames[[1]][1+fin.lass$beta@i])])
+summary(ln_late)
+foo <- boot(d, function(data,indices)
+  summary(lm(ilate~., data = subset(d2[indices, c("ilate", fin.lass$beta@Dimnames[[1]][1+fin.lass$beta@i])])))$adj.r.squared,R=1000)
+foo$t0
+quantile(foo$t,c(0.025,0.975))
+
+```
+
+### Plot Predicted and Experimental Functional Parameters
+
+```{r ilate_raw_plot, echo=TRUE}
+# plot relationships between functional parameters and calculated structure-based
+# functional parameters.
+plot(d$blast, d$ilate, cex=2, lwd=2)
+plt.loess(loess(d$ilate~as.numeric(d$blast), span=0.7),ylabel= "Peak Current")
+
+plot(d$NeighborCount, d$ilate, cex=2, lwd=1)
+plt.loess(loess(d$ilate~as.numeric(d$NeighborCount), span=0.7),ylabel= "Peak Current")
+
+```
+
+### Plot Predicted and Experimental Late Current
+
+```{r ilate_exp_pred, fig.height=8, fig.width=8}
+plot(log10(ln_late$fitted.values),log10(ln_late$model$ilate))
+abline(a=0,b=1)
+```
+
+
+## Vhalf Activation
+Result isn't stable through CV with LASSO.
+
+### Parameter Selection for Vhalf Activation Model
+
+```{r LASSO_vhalfact}
+
+d2 <- d[, which(names(d) %in% c("vhalfact", "vhalfact_dist", "vhalfact_dist_weight", comps))]
+d2 <- d2[complete.cases(d2),]
+
+cv.lass <- cv.glmnet( as.matrix(d2[,-which(names(d2)=="vhalfact")]), d2$vhalfact) 
+fin.lass <- glmnet(as.matrix(d2[,-which(names(d2)=="vhalfact")]), d2$vhalfact, lambda = cv.lass$lambda.min)  
+fin.lass$beta
+
+
+```
+
+```{r LASSO_vhalfact_CV_modelling}
+# very volatile again.
+LASSO_CV(d,10,comps,"vhalfact")
+
+```
+
+### Predicting Vhalf Activation with Best Predictors found in Previous Step and bootstrap 95% CIs
+
+```{r vact_lm}
+# all predictors
+ln_vact <- lm(vhalfact~., data = subset(d2, select = c(vhalfact, 1+fin.lass$beta@i)))
+summary(ln_vact)
+foo <- boot(d, function(data,indices)
+  summary(lm(vhalfact~., data = subset(d2[indices,], select = c(vhalfact,1+fin.lass$beta@i))))$adj.r.squared,R=1000)
+foo$t0
+quantile(foo$t,c(0.025,0.975))
+
+
+```
+
+
+## Vhalf Inactivation
+
+### Parameter Selection for Vhalf Inactivation Model
+
+```{r LASSO_vhalfinact}
+
+d2 <- d[, which(names(d) %in% c("vhalfinact", "vhalfinact_dist", "vhalfinact_dist_weight", comps))]
+d2 <- d2[complete.cases(d2),]
+
+cv.lass <- cv.glmnet( as.matrix(d2[,-which(names(d2)=="vhalfinact")]), d2$vhalfinact) 
+fin.lass <- glmnet(as.matrix(d2[,-which(names(d2)=="vhalfinact")]), d2$vhalfinact, lambda = cv.lass$lambda.min)  
+fin.lass$beta
+
+
+```
+
+```{r LASSO_vhalfinact_CV_modelling}
+
+LASSO_CV(d,10,comps,"vhalfinact")
+#mean  0.117180420884853  95% CI:  0.0606976335554824 ,  0.192075000486572
+
+```
+
+### Predicting Vhalf Inactivation with Best Predictors found in Previous Step and bootstrap 95% CIs
+
+```{r vinact_lm}
+# all predictors
+ln_peak <- lm(vhalfinact~., data = d2[, c("vhalfinact", fin.lass$beta@Dimnames[[1]][1+fin.lass$beta@i])])
+summary(ln_peak)
+foo <- boot(d, function(data,indices)
+  summary(lm(vhalfinact~., data = d2[indices, c("vhalfinact", fin.lass$beta@Dimnames[[1]][1+fin.lass$beta@i])]))$adj.r.squared, R=1000)
+foo$t0
+quantile(foo$t,c(0.025,0.975))
+
+#[1] 0.1681157
+#      2.5%      97.5% 
+#0.08298256 0.34876562 
+
+```
+
+### Plot Predicted and Experimental Functional Parameters
+
+```{r vinact_raw_plot, echo=TRUE}
+# plot relationships between functional parameters and calculated structure-based
+# functional parameters.
+plot(d$vhalfinact_dist, d$vhalfinact, cex=2, lwd=2)
+plt.loess(loess(d$vhalfinact~as.numeric(d$vhalfinact_dist), span=0.7),ylabel= "Peak Current")
+
+#plot(d$polyphen2, d$vhalfinact, cex=2, lwd=1, xlim = c(-5,10))
+#plt.loess(loess(d$vhalfinact~as.numeric(d$polyphen2), span=0.7),ylabel= "Peak Current")
+
+
+```
+
+### Plot Predicted and Experimental Vinact
+
+```{r vinact_exp_pred}
+plot(ln_vinact$fitted.values,ln_vinact$model$vhalfinact)
+abline(a=0,b=1)
+```
+
+
+## Recovery from Inactivation
+
+LASSO doesn't keep covariates consistantly when recovfrominact is not transformed. Same problem when data are log10 transformed 
+
+### Parameter Selection for Recovery from Inactivation Model
+
+```{r LASSO_recov}
+
+d2 <- d[, which(names(d) %in% c("recovfrominact", "recovfrominact_dist", "recovfrominact_dist_weight", comps))]
+d2 <- d2[complete.cases(d2),]
+
+cv.lass <- cv.glmnet( as.matrix(d2[,-which(names(d2)=="recovfrominact")]), d2$recovfrominact) 
+fin.lass <- glmnet(as.matrix(d2[,-which(names(d2)=="recovfrominact")]), d2$recovfrominact, lambda = cv.lass$lambda.min)  
+fin.lass$beta
+
+
+```
+
+```{r LASSO_recovfrominact_CV_modelling}
+
+LASSO_CV(d,10,comps,"recovfrominact")
+
+```
+
+### Predicting Recovery from Inactivation with Best Predictors found in Previous Step and bootstrap 95% CIs
+
+```{r recov_lm}
+# all predictors
+ln_recov <- lm(recovfrominact~., data = d2[, c("recovfrominact", fin.lass$beta@Dimnames[[1]][1+fin.lass$beta@i])])
+summary(ln_recov)
+foo <- boot(d, function(data,indices)
+  summary(lm(recovfrominact~., data = d2[indices, c("recovfrominact", fin.lass$beta@Dimnames[[1]][1+fin.lass$beta@i])]))$adj.r.squared, R=1000)
+foo$t0
+quantile(foo$t,c(0.025,0.975))
+
+```
+
+### Plot Predicted and Experimental Functional Parameters
+
+```{r recov_raw_plot, echo=TRUE}
+# plot relationships between functional parameters and calculated structure-based
+# functional parameters.
+plot(log10(d$recovfrominact_dist+0.001), log10(d$recovfrominact), cex=2, lwd=2)
+plt.loess(loess(log10(d$recovfrominact)~log10(as.numeric(d$recovfrominact_dist+0.001)), span=0.7),ylabel= "Peak Current")
+
+```
+
+### Plot Predicted and Experimental Recovery from Inactivation
+
+```{r recovinact_exp_pred, fig.height=8, fig.width=8}
+plot(ln_recov$fitted.values,ln_recov$model$recovfrominact)
+abline(a=0,b=1)
+```
+
+# Predicting Penetrance
+
+## BrS1
+
+### Parameter Selection for BrS1 Model
+
+```{r LASSO_BrS1}
+
+d2 <- d[, which(names(d) %in% c( "brs1_penetrance_dist","brs1_penetrance_dist_weight", "pamscore", "SIFT.Score", "eaRate", "blastpssm", "NeighborVector", "NeighborCount",
+        "provean_score", "polyphen2", "aaneigh", "aaneighvector","BrS_penetranceBayesian", "resnum"))]
+d2 <- d2[complete.cases(d2),]
+
+cv.lass <- cv.glmnet( as.matrix(d2[,-which(names(d2)=="BrS_penetranceBayesian")]), d2$BrS_penetranceBayesian) 
+fin.lass <- glmnet(as.matrix(d2[,-which(names(d2)=="BrS_penetranceBayesian")]), d2$BrS_penetranceBayesian, lambda = cv.lass$lambda.min)  
+fin.lass$beta
+
+```
+
+### Predicting Recovery from Inactivation with Best Predictors found in Previous Step and bootstrap 95% CIs
+
+```{r BrS1_lm}
+# all predictors
+ln_BrS1 <- lm(BrS_penetranceBayesian~., data = subset(d2, select = c(BrS_penetranceBayesian,1 + fin.lass$beta@i)))
+summary(ln_BrS1)
+foo <- boot(d, function(data,indices)
+  summary(lm(BrS_penetranceBayesian~., data = subset(d2[indices,], select = c(BrS_penetranceBayesian, 1+fin.lass$beta@i))))$adj.r.squared,R=1000)
+foo$t0
+quantile(foo$t,c(0.025,0.975))
+```
+
+## LQT3
+
+### Parameter Selection for lqt3 Model
+
+```{r LASSO_lqt3}
+
+d2 <- d[, which(names(d) %in% c( "lqt3_penetrance_dist", "lqt3_penetrance_dist_weight", "pamscore", "SIFT.Score", "eaRate", "blastpssm", "NeighborVector", "NeighborCount",
+        "provean_score", "polyphen2", "aaneigh", "aaneighvector","LQT_penetranceBayesian", "resnum"))]
+d2 <- d2[complete.cases(d2),]
+
+cv.lass <- cv.glmnet( as.matrix(d2[,-which(names(d2)=="LQT_penetranceBayesian")]), d2$LQT_penetranceBayesian) 
+fin.lass <- glmnet(as.matrix(d2[,-which(names(d2)=="LQT_penetranceBayesian")]), d2$LQT_penetranceBayesian, lambda = cv.lass$lambda.min)  
+fin.lass$beta
+
+```
+
+### Predicting LQT3 with Best Predictors found in Previous Step and bootstrap 95% CIs
+
+```{r lqt3_lm}
+# all predictors
+ln_lqt3 <- lm(LQT_penetranceBayesian~., data = subset(d2, select = c(LQT_penetranceBayesian, 1 + fin.lass$beta@i)))
+summary(ln_lqt3)
+foo <- boot(d, function(data,indices)
+  summary(lm(LQT_penetranceBayesian~., data = subset(d2[indices,], select = c(LQT_penetranceBayesian, 1+fin.lass$beta@i))))$adj.r.squared,R=1000)
+foo$t0
+quantile(foo$t,c(0.025,0.975))
+```
+
+### Plot Predicted and Experimental Functional Parameters
+
+```{r lqt_raw_plot, echo=TRUE}
+# plot relationships between functional parameters and calculated structure-based
+# functional parameters.
+plot(d$brs1_penetrance_dist, d$BrS_penetranceBayesian, cex=2, lwd=2)
+plt.loess(loess(d$BrS_penetranceBayesian~d$brs1_penetrance_dist, span=0.7),ylabel= "Peak Current")
+
+plot(d$lqt3_penetrance_dist, d$LQT_penetranceBayesian, cex=2, lwd=2)
+plt.loess(loess(d$LQT_penetranceBayesian~d$lqt3_penetrance_dist, span=0.7),ylabel= "Peak Current")
+```
+
+### Plot Predicted and Experimental Vinact
+
+```{r brs_lqt3_exp_pred}
+plot(ln_BrS1$fitted.values,ln_BrS1$model$BrS_penetranceBayesian, cex=2, lwd=2, ylim = c(0,max(ln_BrS1$model$BrS_penetranceBayesian)), xlim = c(0, max(ln_BrS1$model$BrS_penetranceBayesian)))
+abline(a=0,b=1)
+
+plot(ln_lqt3$fitted.values,ln_lqt3$model$LQT_penetranceBayesian, cex=2, lwd=2, ylim = c(0,max(ln_lqt3$model$LQT_penetranceBayesian)), xlim = c(0, max(ln_lqt3$model$LQT_penetranceBayesian)))
+abline(a=0,b=1)
+```
+
+
+# ROCs for predicting LOF based on ipeak current < 50%
+
+```{r ROCs}
+source("/Users/Brett/Dropbox/SCN5A/jeff roc fnc.r")
+
+fglm<-d[!is.na(d$ipeak_dist), ]
+modfunc <- glm(LOF~blastpssm+eaRate+polyphen2+pamscore+provean_score+SIFT+ipeak_dist, data=fglm, family='binomial')
+mod <- glm(LOF~blastpssm+eaRate+polyphen2+pamscore+provean_score+SIFT, data=fglm, family='binomial')
+summary(mod)
+
+roc.ci(d$LOF[row.names(d) %in% as.numeric(names(predict(modfunc)))], predict(modfunc))
+
+roc.ci(d$LOF[row.names(d) %in% as.numeric(names(predict(mod)))], predict(mod))
+
+library(pROC)
+modfunc1 <- glm(LOF~polyphen2, data = fglm, family = 'binomial')
+modfunc2 <- glm(LOF~eaRate, data = fglm, family = 'binomial')
+modfunc3 <- glm(LOF~blastpssm, data = fglm, family = 'binomial')
+modfunc4 <- glm(LOF~provean_score, data = fglm, family = 'binomial')
+modfunc5 <- glm(LOF~SIFT, data = fglm, family = 'binomial')
+modfunc6 <- glm(LOF~blastpssm+eaRate+polyphen2+pamscore+provean_score+SIFT, data = fglm, family = 'binomial')
+modfunc7 <- glm(LOF~blastpssm+eaRate+polyphen2+pamscore+provean_score+SIFT+ipeak_dist, data = fglm, family = 'binomial')
+
+funs <- list(modfunc2, modfunc3, modfunc4, modfunc5, modfunc6, modfunc7)
+colrs <- c("red", "green", "yellow", "orange", "blue", "black")
+i=0
+par(pty="s")
+tmp<-roc(d$LOF[row.names(d) %in% as.numeric(names(predict(modfunc1)))], predict(modfunc1), ci=T)
+print(tmp$auc)
+print(tmp$ci)
+plot.roc(tmp, col = "magenta")
+for(li in funs){
+  i=i+1
+  tmp<-roc(d$LOF[row.names(d) %in% as.numeric(names(predict(li)))], predict(li), ci=T)
+  print(tmp$auc)
+  print(tmp$ci)
+  plot.roc(tmp,add = T, col = colrs[i])
+}
+
+```
